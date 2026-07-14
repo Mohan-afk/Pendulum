@@ -31,10 +31,10 @@ ROD_LENGTH_M = 0.5
 G = 9.81
 GRAVITY_COEFF = ROD_MASS_KG * G * (ROD_LENGTH_M / 2)  # peak gravity torque, Nm
 
-K_SOFT = 1.0    # restoring "stiffness" toward pi - much softer than a position-hold kp
-D_SOFT = 0.3    # damping
-KI_SOFT = 0.15  # integral gain - kills steady-state offset, doesn't affect softness
-I_MAX = 0.5     # anti-windup clamp on the integral term's torque contribution (Nm)
+K_SOFT = 2    # restoring "stiffness" toward pi - much softer than a position-hold kp
+D_SOFT = 0.2    # damping
+KI_SOFT = 0.01  # integral gain - kills steady-state offset, doesn't affect softness
+I_MAX = 1.0     # anti-windup clamp on the integral term's torque contribution (Nm)
 
 SWING_DURATION = 4.0   # seconds to get from 0 to pi before handing off to the balance law
 
