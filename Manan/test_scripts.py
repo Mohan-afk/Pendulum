@@ -26,6 +26,7 @@ down + stops before exiting.
 
 import argparse
 import math
+import struct
 import sys
 import time
 import unittest
@@ -34,6 +35,7 @@ from unittest import mock
 import can
 
 import at_can_bus as atc
+import motor_control as mc
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +174,182 @@ class TestATCanBusFraming(unittest.TestCase):
         self.assertIsNone(got)
 
 
+class TestNativeModeFraming(unittest.TestCase):
+    """Native Current/Velocity/Location mode helpers should all go through
+    write_param_f32 with the right index/value, clamp to the documented
+    ranges instead of overflowing, and set_run_mode_* should write the
+    right run_mode byte via write_param_u8."""
+
+    def setUp(self):
+        self.sent = []
+        patcher = mock.patch.object(
+            atc, 'write_param_f32',
+            side_effect=lambda bus, motor_id, param_id, value, host_id=atc.HOST_ID, timeout=0.1:
+                self.sent.append((param_id, value)),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_set_current_uses_iq_ref(self):
+        atc.set_current(None, 1, 5.0)
+        self.assertEqual(self.sent[-1], (atc.PARAM_IQ_REF, 5.0))
+
+    def test_set_current_clamps_range(self):
+        atc.set_current(None, 1, 999.0)
+        self.assertEqual(self.sent[-1], (atc.PARAM_IQ_REF, atc.IQ_MAX))
+        atc.set_current(None, 1, -999.0)
+        self.assertEqual(self.sent[-1], (atc.PARAM_IQ_REF, atc.IQ_MIN))
+
+    def test_set_velocity_uses_spd_ref_and_clamps(self):
+        atc.set_velocity(None, 1, 40.0)
+        self.assertEqual(self.sent[-1], (atc.PARAM_SPD_REF, atc.V_MAX))
+
+    def test_set_velocity_limit_cur_clamps(self):
+        atc.set_velocity_limit_cur(None, 1, -5.0)
+        self.assertEqual(self.sent[-1], (atc.PARAM_LIMIT_CUR, atc.CUR_LIMIT_MIN))
+        atc.set_velocity_limit_cur(None, 1, 50.0)
+        self.assertEqual(self.sent[-1], (atc.PARAM_LIMIT_CUR, atc.CUR_LIMIT_MAX))
+
+    def test_set_location_uses_loc_ref_and_clamps(self):
+        atc.set_location(None, 1, 20.0)
+        self.assertEqual(self.sent[-1], (atc.PARAM_LOC_REF, atc.P_MAX))
+
+    def test_position_pp_profile_writes_both_params(self):
+        atc.set_position_pp_profile(None, 1, vel_max=10.0, acc_set=20.0)
+        self.assertIn((atc.PARAM_VEL_MAX, 10.0), self.sent)
+        self.assertIn((atc.PARAM_ACC_SET, 20.0), self.sent)
+
+    def test_position_csp_limit_spd(self):
+        atc.set_position_csp_limit_spd(None, 1, 8.0)
+        self.assertEqual(self.sent[-1], (atc.PARAM_LIMIT_SPD, 8.0))
+
+
+class TestRunModeSwitching(unittest.TestCase):
+    """set_run_mode_* wrappers should each write the correct run_mode value
+    via write_param_u8 (mode 18, single byte)."""
+
+    def setUp(self):
+        self.sent = []
+        patcher = mock.patch.object(
+            atc, 'write_param_u8',
+            side_effect=lambda bus, motor_id, param_id, value, host_id=atc.HOST_ID, timeout=0.1:
+                self.sent.append((param_id, value)),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_mit(self):
+        atc.set_run_mode_mit(None, 1)
+        self.assertEqual(self.sent[-1], (atc.PARAM_RUN_MODE, atc.RUN_MODE_MIT))
+
+    def test_current(self):
+        atc.set_run_mode_current(None, 1)
+        self.assertEqual(self.sent[-1], (atc.PARAM_RUN_MODE, atc.RUN_MODE_CURRENT))
+
+    def test_velocity(self):
+        atc.set_run_mode_velocity(None, 1)
+        self.assertEqual(self.sent[-1], (atc.PARAM_RUN_MODE, atc.RUN_MODE_VELOCITY))
+
+    def test_position_pp(self):
+        atc.set_run_mode_position_pp(None, 1)
+        self.assertEqual(self.sent[-1], (atc.PARAM_RUN_MODE, atc.RUN_MODE_POSITION_PP))
+
+    def test_position_csp(self):
+        atc.set_run_mode_position_csp(None, 1)
+        self.assertEqual(self.sent[-1], (atc.PARAM_RUN_MODE, atc.RUN_MODE_POSITION_CSP))
+
+
+class TestWriteParamF32Framing(unittest.TestCase):
+    """write_param_f32 must lay out bytes exactly per the protocol: u16
+    index, 2 zero bytes, f32 little-endian value - and actually go out
+    over the bus."""
+
+    def setUp(self):
+        patcher = mock.patch.object(atc.serial, 'Serial', FakeSerial)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.bus = atc.ATCanBus('FAKE')
+        self.addCleanup(self.bus.shutdown)
+
+    def test_byte_layout(self):
+        self.bus.recv = lambda timeout=None: None  # no motor to reply
+        atc.write_param_f32(self.bus, 1, atc.PARAM_SPD_REF, 5.0)
+        raw = bytes(self.bus.ser._buf)
+        dlc = raw[6]
+        data = raw[7:7 + dlc]
+        self.assertEqual(dlc, 8)
+        idx, zero, val = struct.unpack('<HHf', data)
+        self.assertEqual(idx, atc.PARAM_SPD_REF)
+        self.assertEqual(zero, 0)
+        self.assertAlmostEqual(val, 5.0, places=5)
+
+
+class TestNativeModeCallOrder(unittest.TestCase):
+    """Regression test for a real bug: the RobStride manual's precautions
+    section says "Do not switch the control mode when the joint is
+    running. If you need to switch, send the command to stop the
+    operation before switching." motor_control.main() enables the motor
+    (in MIT mode) before dispatching to any subcommand, so each native
+    run_*_mode() helper MUST call stop() before its set_run_mode_*() call
+    - otherwise the mode switch (and everything depending on it, like
+    spd_ref) is silently ignored and the motor never leaves MIT mode."""
+
+    def setUp(self):
+        self.calls = []
+
+        def record(name):
+            def _fn(*a, **kw):
+                self.calls.append(name)
+            return _fn
+
+        def record_and_raise_once(name):
+            state = {'raised': False}
+
+            def _fn(*a, **kw):
+                self.calls.append(name)
+                if not state['raised']:
+                    state['raised'] = True
+                    raise KeyboardInterrupt
+            return _fn
+
+        patches = [
+            mock.patch.object(mc, 'stop', side_effect=record('stop')),
+            mock.patch.object(mc, 'enable', side_effect=record('enable')),
+            mock.patch.object(mc, 'set_run_mode_current', side_effect=record('set_run_mode_current')),
+            mock.patch.object(mc, 'set_run_mode_velocity', side_effect=record('set_run_mode_velocity')),
+            mock.patch.object(mc, 'set_run_mode_position_pp', side_effect=record('set_run_mode_position_pp')),
+            mock.patch.object(mc, 'set_run_mode_position_csp', side_effect=record('set_run_mode_position_csp')),
+            mock.patch.object(mc, 'set_velocity_limit_cur', side_effect=record('set_velocity_limit_cur')),
+            mock.patch.object(mc, 'set_velocity_accel', side_effect=record('set_velocity_accel')),
+            mock.patch.object(mc, 'set_position_pp_profile', side_effect=record('set_position_pp_profile')),
+            mock.patch.object(mc, 'set_position_csp_limit_spd', side_effect=record('set_position_csp_limit_spd')),
+            mock.patch.object(mc, 'set_current', side_effect=record_and_raise_once('set_current')),
+            mock.patch.object(mc, 'set_velocity', side_effect=record_and_raise_once('set_velocity')),
+            mock.patch.object(mc, 'set_location', side_effect=record_and_raise_once('set_location')),
+            mock.patch.object(mc, 'decode_feedback', return_value=None),
+            mock.patch.object(mc.time, 'sleep', return_value=None),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_current_mode_stops_before_switching(self):
+        mc.run_current_mode(None, 1, target_iq=2.0)
+        self.assertEqual(self.calls[:3], ['stop', 'set_run_mode_current', 'enable'])
+
+    def test_velocity_mode_stops_before_switching(self):
+        mc.run_velocity_native_mode(None, 1, target_vel=5.0)
+        self.assertEqual(self.calls[:3], ['stop', 'set_run_mode_velocity', 'enable'])
+
+    def test_location_mode_pp_stops_before_switching(self):
+        mc.run_location_mode(None, 1, target_rad=1.0, mode_type='pp')
+        self.assertEqual(self.calls[:3], ['stop', 'set_run_mode_position_pp', 'enable'])
+
+    def test_location_mode_csp_stops_before_switching(self):
+        mc.run_location_mode(None, 1, target_rad=1.0, mode_type='csp')
+        self.assertEqual(self.calls[:3], ['stop', 'set_run_mode_position_csp', 'enable'])
+
+
 def run_offline_tests():
     loader = unittest.TestLoader()
     suite = unittest.TestSuite([
@@ -179,6 +357,10 @@ def run_offline_tests():
         loader.loadTestsFromTestCase(TestMakeId),
         loader.loadTestsFromTestCase(TestDecodeFeedback),
         loader.loadTestsFromTestCase(TestATCanBusFraming),
+        loader.loadTestsFromTestCase(TestNativeModeFraming),
+        loader.loadTestsFromTestCase(TestRunModeSwitching),
+        loader.loadTestsFromTestCase(TestWriteParamF32Framing),
+        loader.loadTestsFromTestCase(TestNativeModeCallOrder),
     ])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return result.wasSuccessful()

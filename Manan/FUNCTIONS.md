@@ -10,7 +10,11 @@ All examples assume:
 ```python
 from at_can_bus import (
     ATCanBus, enable, stop, set_zero, set_run_mode_mit,
-    control, decode_feedback, write_param_u8,
+    control, decode_feedback, write_param_u8, write_param_f32,
+    set_run_mode, set_run_mode_current, set_current,
+    set_run_mode_velocity, set_velocity, set_velocity_limit_cur, set_velocity_accel,
+    set_run_mode_position_pp, set_run_mode_position_csp,
+    set_position_pp_profile, set_position_csp_limit_spd, set_location,
 )
 ```
 
@@ -30,9 +34,22 @@ directly, but function signatures below refer to them.
 | `KD_MIN, KD_MAX` | `0.0, 5.0` | Damping gain range |
 | `T_MIN, T_MAX` | `-14.0, 14.0` | Torque range, Nm |
 | `MODE_CONTROL` … `MODE_PARAM_WRITE` | `1, 2, 3, 4, 6, 17, 18` | Frame "mode" values (control / feedback / enable / stop / set-zero / param-read / param-write) |
-| `PARAM_RUN_MODE` | `0x7005` | Parameter index: 0=MIT, 1=position, 2=velocity, 3=current |
-| `PARAM_SPD_REF`, `PARAM_LIMIT_CUR`, `PARAM_ACC_RAD` | `0x700A, 0x7018, 0x7022` | Other parameter indices used with `write_param_u8` |
+| `PARAM_RUN_MODE` | `0x7005` | Parameter index: 0=MIT, 1=position(PP), 2=velocity, 3=current, 5=position(CSP) |
+| `PARAM_IQ_REF` | `0x7006` | Native Current mode: target Iq current (A) |
+| `PARAM_SPD_REF` | `0x700A` | Native Velocity mode: target speed (rad/s) |
+| `PARAM_LOC_REF` | `0x7016` | Native Position modes (PP & CSP): target position (rad) |
+| `PARAM_LIMIT_SPD` | `0x7017` | Native Position/CSP mode: speed limit (rad/s) |
+| `PARAM_LIMIT_CUR` | `0x7018` | Native Velocity/Position mode: current limit (A) |
+| `PARAM_ACC_RAD` | `0x7022` | Native Velocity mode: acceleration (rad/s²) |
+| `PARAM_VEL_MAX` | `0x7024` | Native Position/PP mode: max velocity (rad/s) |
+| `PARAM_ACC_SET` | `0x7025` | Native Position/PP mode: acceleration (rad/s²) |
 | `RUN_MODE_MIT` | `0` | The run mode `control()` expects |
+| `RUN_MODE_POSITION_PP` (alias `RUN_MODE_POSITION`) | `1` | Native Position mode, profile-position variant - motor plans its own trajectory |
+| `RUN_MODE_VELOCITY` | `2` | Native Velocity mode |
+| `RUN_MODE_CURRENT` | `3` | Native Current mode |
+| `RUN_MODE_POSITION_CSP` | `5` | Native Position mode, cyclic-synchronous-position variant - you stream `loc_ref` |
+| `IQ_MIN, IQ_MAX` | `-16.0, 16.0` | Native Current mode command range, A |
+| `CUR_LIMIT_MIN, CUR_LIMIT_MAX` | `0.0, 16.0` | Native Velocity/Position current-limit range, A |
 
 ---
 
@@ -159,6 +176,28 @@ from at_can_bus import write_param_u8, PARAM_LIMIT_CUR
 write_param_u8(bus, motor_id=1, param_id=PARAM_LIMIT_CUR, value=10)  # cap current
 ```
 
+### `write_param_f32(bus, motor_id, param_id, value, host_id=HOST_ID, timeout=0.1)`
+
+Generic 32-bit float parameter write (mode 18, non-persistent) — bytes
+0-1 are the `param_id` (u16), bytes 2-3 are zero, bytes 4-7 are `value`
+packed as a little-endian float. This is what every native-mode command
+below (`set_current`, `set_velocity`, `set_location`, the limit/profile
+setters, …) is built on. You'll rarely call it directly.
+
+```python
+from at_can_bus import write_param_f32, PARAM_SPD_REF
+write_param_f32(bus, motor_id=1, param_id=PARAM_SPD_REF, value=5.0)
+```
+
+### `set_run_mode(bus, motor_id, run_mode, host_id=HOST_ID, timeout=0.1)`
+
+Writes the `run_mode` parameter (`0x7005`) — selects which native control
+mode the motor's parameter-write-driven reference (`iq_ref` / `spd_ref` /
+`loc_ref`) applies to. `set_run_mode_mit` and the `set_run_mode_current` /
+`_velocity` / `_position_pp` / `_position_csp` wrappers below all just
+call this with the matching `RUN_MODE_*` constant. Always (re-)`enable()`
+after switching modes.
+
 ### `control(bus, motor_id, position=0.0, velocity=0.0, kp=0.0, kd=0.0, torque=0.0, host_id=HOST_ID, timeout=0.05)`
 
 The one function that actually drives the motor (mode 1). The motor's
@@ -207,6 +246,113 @@ if fb:
     pos, vel, tor, temp = fb
     print(f"pos={pos:+.3f} rad  vel={vel:+.3f} rad/s  torque={tor:+.3f} Nm  temp={temp:.1f}C")
 ```
+
+---
+
+## 3a. Native Current / Velocity / Location modes (at_can_bus.py)
+
+Unlike `control()` (which always uses MIT/operation mode, `run_mode=0`,
+and blends position/velocity/torque via `kp`/`kd`), these put the motor
+into one of its own dedicated `run_mode`s and drive it with the matching
+native reference parameter. Use `set_run_mode_mit` + `control()` for the
+MIT/operation style; use these when you specifically want the motor
+firmware's own current, speed, or position loop.
+
+**Common pattern:** `stop()` (disable) → switch mode → `enable()` →
+(optionally set limits/profile) → repeatedly call the `set_*` command
+function.
+
+**The `stop()` before switching modes is not optional.** The RobStride
+manual's precautions section is explicit: *"Do not switch the control
+mode when the joint is running. If you need to switch, send the command
+to stop the operation before switching."* If you call `set_run_mode_*`
+while the motor is already enabled (e.g. it was left running from a
+previous mode, or `main()`'s shared preamble just enabled it in MIT
+mode), the mode switch is silently ignored - the motor stays in whatever
+mode it was already in, and the reference parameter you think you're
+driving (`spd_ref`, `iq_ref`, `loc_ref`, ...) has no effect. This is
+exactly the bug behind "velocity mode does nothing, target stays at
+zero": `set_run_mode_velocity()` was being called while the motor was
+still enabled from the earlier MIT-mode setup, so it never actually left
+`run_mode=0`. `motor_control.py`'s `run_current_mode` /
+`run_velocity_native_mode` / `run_location_mode` all call `stop()` first
+for this reason - do the same in any custom script that calls these
+`at_can_bus` functions directly.
+
+### Current mode (`run_mode=3`)
+
+```python
+from at_can_bus import set_run_mode_current, enable, set_current, stop
+
+stop(bus, motor_id=1)                # required: disable before switching mode
+set_run_mode_current(bus, motor_id=1)
+enable(bus, motor_id=1)
+set_current(bus, motor_id=1, iq_ref=2.0)   # 2 A Iq command, clamped to [-16, 16] A
+```
+
+- `set_run_mode_current(bus, motor_id, host_id=HOST_ID, timeout=0.1)` — switches to native Current mode.
+- `set_current(bus, motor_id, iq_ref, host_id=HOST_ID, timeout=0.1)` — commands Iq current directly, in Amps.
+
+No position/velocity loop is involved — a free shaft will accelerate as
+long as a nonzero current is held, same caution as `torque` mode.
+
+### Velocity mode (`run_mode=2`)
+
+```python
+from at_can_bus import (
+    set_run_mode_velocity, enable, set_velocity_limit_cur, set_velocity_accel, set_velocity, stop,
+)
+
+stop(bus, motor_id=1)                 # required: disable before switching mode
+set_run_mode_velocity(bus, motor_id=1)
+enable(bus, motor_id=1)
+set_velocity_limit_cur(bus, motor_id=1, limit_cur=8.0)   # optional, clamped to [0, 16] A
+set_velocity_accel(bus, motor_id=1, acc_rad=10.0)         # optional, rad/s^2
+set_velocity(bus, motor_id=1, spd_ref=5.0)                # rad/s, clamped to [-33, 33]
+```
+
+This is the motor's own onboard speed loop — distinct from
+`motor_control.run_velocity()`, which fakes velocity control by zeroing
+`kp` in an MIT-mode `control()` frame.
+
+### Location mode (`run_mode=1` PP, or `run_mode=5` CSP)
+
+Two flavors, both commanded through `set_location`:
+
+- **PP** (Profile Position, `run_mode=1`) — the motor plans its own
+  trajectory to the target using `vel_max`/`acc_set`. Set the profile
+  once; per the RobStride docs, PP does not support changing
+  `vel_max`/`acc_set` mid-move.
+- **CSP** (Cyclic Synchronous Position, `run_mode=5`) — no on-board
+  trajectory planning; you stream `loc_ref` continuously and the motor
+  tracks it, capped by `limit_spd`.
+
+```python
+from at_can_bus import (
+    set_run_mode_position_pp, set_run_mode_position_csp, enable,
+    set_position_pp_profile, set_position_csp_limit_spd, set_location, stop,
+)
+
+# PP: one-shot move, motor handles the trajectory
+stop(bus, motor_id=1)                  # required: disable before switching mode
+set_run_mode_position_pp(bus, motor_id=1)
+enable(bus, motor_id=1)
+set_position_pp_profile(bus, motor_id=1, vel_max=10.0, acc_set=20.0)
+set_location(bus, motor_id=1, loc_ref=1.57)
+
+# CSP: stream a moving setpoint yourself
+stop(bus, motor_id=1)                  # required: disable before switching mode
+set_run_mode_position_csp(bus, motor_id=1)
+enable(bus, motor_id=1)
+set_position_csp_limit_spd(bus, motor_id=1, limit_spd=10.0)
+for target in trajectory:
+    set_location(bus, motor_id=1, loc_ref=target)
+```
+
+- `set_run_mode_position_pp` / `set_run_mode_position_csp(bus, motor_id, host_id=HOST_ID, timeout=0.1)` — switch to the respective mode.
+- `set_position_pp_profile(bus, motor_id, vel_max, acc_set, host_id=HOST_ID, timeout=0.1)` — PP only, set once before moving.
+- `set_position_csp_limit_spd(bus, motor_id, limit_spd, host_id=HOST_ID, timeout=0.1)` — CSP only, caps tracking speed.
+- `set_location(bus, motor_id, loc_ref, host_id=HOST_ID, timeout=0.1)` — target position, rad, clamped to `[-12.57, 12.57]`. Works for either flavor once the mode is set.
 
 ---
 
@@ -356,6 +502,55 @@ run_torque(bus, motor_id=1, target_torque=0.3, kd_safety=0.5)
 python motor_control.py torque --target-nm 0.3 --kd-safety 0.5
 ```
 
+### `run_current_mode(bus, motor_id, target_iq, ramp_down_steps=30, dt=0.02)`
+
+Native Current mode (`run_mode=3`): commands Iq current directly, in Amps,
+via `at_can_bus.set_current`. No position/velocity loop — ramps the
+current down to 0 (over `ramp_down_steps` cycles) on Ctrl+C instead of
+cutting it abruptly.
+
+```python
+run_current_mode(bus, motor_id=1, target_iq=2.0)   # 2 A
+```
+
+```bash
+python motor_control.py current-mode --target-a 2.0
+```
+
+### `run_velocity_native_mode(bus, motor_id, target_vel, limit_cur=None, accel=None, ramp_down_steps=30, dt=0.02)`
+
+Native Velocity mode (`run_mode=2`): the motor's own onboard speed loop
+(via `at_can_bus.set_velocity`), as opposed to `run_velocity()`'s
+MIT-frame `kp=0` workaround. Optionally sets a current limit and/or
+acceleration first. Ramps the target speed down to 0 on Ctrl+C.
+
+```python
+run_velocity_native_mode(bus, motor_id=1, target_vel=5.0, limit_cur=8.0, accel=10.0)
+```
+
+```bash
+python motor_control.py velocity-mode --target-rad-s 5.0 --limit-cur 8.0 --accel 10.0
+```
+
+### `run_location_mode(bus, motor_id, target_rad, mode_type='csp', vel_max=10.0, acc_set=20.0, limit_spd=10.0)`
+
+Native Location/Position mode — `mode_type='pp'` for profile-position
+(motor-planned trajectory using `vel_max`/`acc_set`) or `mode_type='csp'`
+(default) for cyclic-synchronous-position (streamed target, capped by
+`limit_spd`). Holds/streams `target_rad` until Ctrl+C. No ramp-down
+needed on stop — there's no runaway risk from a position reference the
+way there is with torque/current/velocity.
+
+```python
+run_location_mode(bus, motor_id=1, target_rad=1.57, mode_type='pp', vel_max=10.0, acc_set=20.0)
+run_location_mode(bus, motor_id=1, target_rad=1.57, mode_type='csp', limit_spd=10.0)
+```
+
+```bash
+python motor_control.py location-mode --target-deg 90 --type pp --vel-max 10 --acc-set 20
+python motor_control.py location-mode --target-deg 90 --type csp --limit-spd 10
+```
+
 ---
 
 ## 7. Minimal end-to-end example
@@ -449,6 +644,12 @@ python read_angle.py
 - `kp=0, kd=0, torque=<fixed value>` will accelerate indefinitely on a
   free shaft. Keep some `kd` damping unless you have a specific,
   deliberate reason not to (see `run_torque`'s `kd_safety`).
+- Native Current mode (`current-mode` / `run_current_mode`) has the same
+  runaway risk as `torque` mode - there's no damping term at all, so only
+  command current you're prepared to see turn into unbounded speed on a
+  free shaft. Native Velocity mode is safer (the motor's speed loop caps
+  it) but still ramps down on exit rather than cutting the target
+  abruptly - don't skip that step if scripting your own loop.
 - Make sure the rod/shaft has full clearance before running any
   position/velocity/torque control.
 - Start with a lower bench-supply current limit while testing new code;
